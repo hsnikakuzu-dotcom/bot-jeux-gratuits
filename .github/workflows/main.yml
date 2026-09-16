@@ -1,0 +1,47 @@
+name: Jeux gratuits
+
+on:
+  schedule:
+    - cron: "*/40 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jeux-gratuits
+  cancel-in-progress: false
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer les dependances
+        run: pip install -r requirements.txt
+
+      - name: Publier les nouveautes sur Discord
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          GAMES_CHANNEL_ID: ${{ secrets.GAMES_CHANNEL_ID }}
+          NEWS_CHANNEL_ID: ${{ secrets.NEWS_CHANNEL_ID }}
+          PING_ROLE_ID: ${{ secrets.PING_ROLE_ID }}
+        run: python bot.py --once
+
+      - name: Memoriser ce qui a ete publie
+        if: always()
+        run: |
+          [ -f posted.json ] || exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f posted.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Mise a jour des publications"
+          git push
