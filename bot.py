@@ -7,6 +7,7 @@ Test sans Discord (affiche ce qui serait publié) :  python bot.py --test
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -45,6 +46,7 @@ def env_list(name: str, default: str) -> list[str]:
 
 TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 GAMES_CHANNEL_ID = env_int("GAMES_CHANNEL_ID")
+UPCOMING_CHANNEL_ID = env_int("UPCOMING_CHANNEL_ID")  # vide = les "bientôt gratuits" vont dans GAMES_CHANNEL_ID
 NEWS_CHANNEL_ID = env_int("NEWS_CHANNEL_ID")
 PING_ROLE_ID = env_int("PING_ROLE_ID")
 CHECK_INTERVAL_MINUTES = max(env_int("CHECK_INTERVAL_MINUTES", 40), 5)
@@ -230,20 +232,31 @@ class FreeGamesBot(discord.Client):
         return True
 
     async def post_free_games(self) -> None:
-        if not GAMES_CHANNEL_ID:
+        if not (GAMES_CHANNEL_ID or UPCOMING_CHANNEL_ID):
             return
         games = await sources.collect_free_games(self.session, PLATFORMS, SHOW_UPCOMING)
+        available = [game for game in games if not game.upcoming]
+        upcoming = [game for game in games if game.upcoming]
+        if UPCOMING_CHANNEL_ID:
+            # Clé propre au salon dédié : les jeux déjà annoncés dans le salon principal y sont aussi publiés
+            upcoming = [dataclasses.replace(game, key=f"{game.key}@{UPCOMING_CHANNEL_ID}") for game in upcoming]
+        await self.post_games(GAMES_CHANNEL_ID, "des jeux disponibles", available)
+        await self.post_games(UPCOMING_CHANNEL_ID or GAMES_CHANNEL_ID, "des jeux bientôt gratuits", upcoming)
+
+    async def post_games(self, channel_id: int, label: str, games: list[sources.FreeGame]) -> None:
+        if not channel_id:
+            return
         new_games = [game for game in games if game.key not in self.state]
         if not new_games:
-            log.info("Jeux gratuits : rien de nouveau (%d offre(s) déjà publiée(s)).", len(games))
+            log.info("Salon %s : rien de nouveau.", label)
             return
-        channel = await self.get_channel_or_log(GAMES_CHANNEL_ID, "des jeux gratuits")
+        channel = await self.get_channel_or_log(channel_id, label)
         if channel is None:
             return
         sent = 0
         for game in new_games:
             sent += await self.send(channel, game.key, game_message(game))
-        log.info("Jeux gratuits : %d nouvelle(s) offre(s) publiée(s).", sent)
+        log.info("Salon %s : %d nouvelle(s) offre(s) publiée(s).", label, sent)
 
     async def post_news(self) -> None:
         if not NEWS_CHANNEL_ID or not NEWS_FEEDS:
@@ -289,7 +302,7 @@ def main() -> None:
         return
     if not TOKEN:
         sys.exit("DISCORD_TOKEN est vide : ouvre le fichier .env avec le Bloc-notes et colle le token de ton bot apres DISCORD_TOKEN=")
-    if not GAMES_CHANNEL_ID and not NEWS_CHANNEL_ID:
+    if not (GAMES_CHANNEL_ID or UPCOMING_CHANNEL_ID or NEWS_CHANNEL_ID):
         sys.exit("GAMES_CHANNEL_ID est vide : ouvre le fichier .env et colle l'identifiant du salon apres GAMES_CHANNEL_ID=")
     client = FreeGamesBot(once="--once" in sys.argv)
     client.run(TOKEN, log_handler=None)
