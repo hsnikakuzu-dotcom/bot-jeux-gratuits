@@ -8,7 +8,9 @@ Le bot publie **tout seul** (aucune commande à taper), toutes les 40 minutes :
 
 Chaque offre n'est publiée **qu'une seule fois**, même si tu redémarres le bot : il garde la liste dans `posted.json`.
 
-Sources : API officielle d'Epic Games et API [GamerPower](https://www.gamerpower.com/api-read) pour les autres plateformes.
+Sources : API officielle d'Epic Games, [GamerPower](https://www.gamerpower.com/api-read), et les communautés
+[Dealabs](https://www.dealabs.com), [GG.deals](https://gg.deals) et [r/FreeGameFindings](https://www.reddit.com/r/FreeGameFindings).
+Quand plusieurs sites parlent du même jeu, il n'est publié qu'une seule fois.
 
 ---
 
@@ -81,7 +83,8 @@ Dans le dépôt, va dans **Settings → Secrets and variables → Actions**. Cli
 | Name               | Secret                                        |
 | ------------------ | --------------------------------------------- |
 | `DISCORD_TOKEN`    | le token du bot                               |
-| `GAMES_CHANNEL_ID` | l'identifiant du salon des jeux gratuits      |
+| `GAMES_CHANNEL_ID` | l'identifiant du salon des jeux gratuits disponibles |
+| `UPCOMING_CHANNEL_ID` | l'identifiant du salon des jeux bientôt gratuits (optionnel) |
 | `NEWS_CHANNEL_ID`  | l'identifiant du salon des actus (optionnel)  |
 | `PING_ROLE_ID`     | l'identifiant du rôle à mentionner (optionnel)|
 

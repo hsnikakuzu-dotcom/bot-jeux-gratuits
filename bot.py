@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -52,6 +53,7 @@ PING_ROLE_ID = env_int("PING_ROLE_ID")
 CHECK_INTERVAL_MINUTES = max(env_int("CHECK_INTERVAL_MINUTES", 40), 5)
 PLATFORMS = env_list("PLATFORMS", "epic-games-store,steam,gog,itchio,ubisoft,origin,battlenet,drm-free")
 SHOW_UPCOMING = (os.getenv("SHOW_UPCOMING") or "true").strip().lower() in {"1", "true", "oui", "yes"}
+COMMUNITY_SOURCES = env_list("COMMUNITY_SOURCES", "dealabs,ggdeals,reddit")
 NEWS_FEEDS = env_list("NEWS_FEEDS", "https://www.jeuxvideo.com/rss/rss.xml,https://www.actugaming.net/feed/")
 NEWS_FIRST_RUN_LIMIT = 3  # 1re lecture d'un flux : on ne publie que les 3 derniers articles (pas tout l'historique)
 
@@ -80,6 +82,7 @@ class State:
     """Mémorise ce qui a déjà été publié (posted.json) pour ne jamais reposter, même après un redémarrage."""
 
     MAX_KEYS = 5000
+    NAME_MEMORY = 30 * 24 * 3600  # un jeu déjà annoncé n'est plus republié par un autre site pendant 30 jours
 
     def __init__(self, path: Path):
         self.path = path
@@ -89,7 +92,12 @@ class State:
             data = {}
         self.keys: list[str] = data.get("posted", [])
         self.feeds: set[str] = set(data.get("feeds", []))
+        self.names: dict[str, float] = data.get("names", {})
         self._seen = set(self.keys)
+
+    def recent_names(self) -> set[str]:
+        cutoff = time.time() - self.NAME_MEMORY
+        return {name for name, posted_at in self.names.items() if posted_at >= cutoff}
 
     def __contains__(self, key: str) -> bool:
         return key in self._seen
@@ -106,9 +114,19 @@ class State:
 
     def save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
-        payload = {"posted": self.keys, "feeds": sorted(self.feeds)}
+        recent = self.recent_names()
+        self.names = {name: posted_at for name, posted_at in self.names.items() if name in recent}
+        payload = {"posted": self.keys, "feeds": sorted(self.feeds), "names": self.names}
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(self.path)
+
+
+def is_duplicate(game: sources.FreeGame, known: set[str]) -> bool:
+    """Le jeu a-t-il déjà été annoncé ? Sans nom clair (« This puzzle game is free… »), on cherche un nom connu dans le texte."""
+    if game.name:
+        return game.name in known
+    text = f" {sources.game_name(f'{game.title} {game.description}') or ''} "
+    return any(len(name) >= 5 and f" {name} " in text for name in known)
 
 
 def discord_time(dt, style: str) -> str:
@@ -126,7 +144,8 @@ def game_message(game: sources.FreeGame) -> dict:
         description=game.description or None,
         color=color,
     )
-    embed.set_author(name=f"{'🔜 Bientôt gratuit' if game.upcoming else '🎁 Jeu gratuit'} • {game.platform}")
+    via = f" • via {game.via}" if game.via else ""
+    embed.set_author(name=f"{'🔜 Bientôt gratuit' if game.upcoming else '🎁 Jeu gratuit'} • {game.platform}{via}")
     if game.worth:
         embed.add_field(name="Prix normal", value=f"~~{game.worth}~~ → **Gratuit**")
     if game.upcoming and game.start:
@@ -139,7 +158,8 @@ def game_message(game: sources.FreeGame) -> dict:
         embed.set_image(url=game.image)  # grande image du jeu
 
     view = discord.ui.View()
-    view.add_item(discord.ui.Button(label="Voir sur le store" if game.upcoming else "Récupérer le jeu", url=game.url, emoji="🔗"))
+    label = "Voir sur le store" if game.upcoming else "Voir l'offre" if game.via else "Récupérer le jeu"
+    view.add_item(discord.ui.Button(label=label, url=game.url, emoji="🔗"))
     content = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID and not game.upcoming else None
     return {"content": content, "embed": embed, "view": view}
 
@@ -222,14 +242,32 @@ class FreeGamesBot(discord.Client):
                 log.error("Salon %s introuvable ou inaccessible (id %s) : %s", label, channel_id, error)
         return channel
 
-    async def send(self, channel, key: str, message: dict) -> bool:
+    async def send(self, channel, key: str, message: dict, name: str | None = None) -> bool:
         try:
             await channel.send(**message)
         except discord.HTTPException as error:
             log.error("Envoi impossible dans #%s : %s", channel, error)
             return False
+        if name:
+            self.state.names[name] = time.time()
         self.state.add(key)
         return True
+
+    def community_offers(self, official: list[sources.FreeGame], community: list[sources.FreeGame]) -> list[sources.FreeGame]:
+        """Garde les offres des sites communautaires qui ne sont pas déjà annoncées par une autre source.
+        Les jeux Epic « bientôt gratuits » comptent aussi : Epic les publiera lui-même le jour venu."""
+        known = self.state.recent_names() | {game.name for game in official if game.name}
+        fresh = []
+        for game in community:
+            if game.key in self.state:
+                continue
+            if is_duplicate(game, known):
+                self.state.add(game.key)  # même jeu déjà annoncé : on l'ignore pour de bon
+                continue
+            if game.name:
+                known.add(game.name)
+            fresh.append(game)
+        return fresh
 
     async def post_free_games(self) -> None:
         if not (GAMES_CHANNEL_ID or UPCOMING_CHANNEL_ID):
@@ -240,6 +278,9 @@ class FreeGamesBot(discord.Client):
         if UPCOMING_CHANNEL_ID:
             # Clé propre au salon dédié : les jeux déjà annoncés dans le salon principal y sont aussi publiés
             upcoming = [dataclasses.replace(game, key=f"{game.key}@{UPCOMING_CHANNEL_ID}") for game in upcoming]
+        if COMMUNITY_SOURCES and GAMES_CHANNEL_ID:
+            community = await sources.collect_community(self.session, COMMUNITY_SOURCES, PLATFORMS)
+            available += self.community_offers(games, community)
         await self.post_games(GAMES_CHANNEL_ID, "des jeux disponibles", available)
         await self.post_games(UPCOMING_CHANNEL_ID or GAMES_CHANNEL_ID, "des jeux bientôt gratuits", upcoming)
 
@@ -255,7 +296,7 @@ class FreeGamesBot(discord.Client):
             return
         sent = 0
         for game in new_games:
-            sent += await self.send(channel, game.key, game_message(game))
+            sent += await self.send(channel, game.key, game_message(game), None if game.upcoming else game.name)
         log.info("Salon %s : %d nouvelle(s) offre(s) publiée(s).", label, sent)
 
     async def post_news(self) -> None:
@@ -288,6 +329,18 @@ async def dry_run() -> None:
             status = "BIENTÔT" if game.upcoming else "GRATUIT"
             end = game.end.strftime("%d/%m/%Y %H:%M") if game.end else "?"
             print(f"[{status}] [{game.platform}] {game.title} | prix: {game.worth or '?'} | fin: {end}\n    {game.url}")
+
+        if COMMUNITY_SOURCES:
+            community = await sources.collect_community(session, COMMUNITY_SOURCES, PLATFORMS)
+            known = {game.name for game in games if game.name}
+            print(f"\n=== {len(community)} offre(s) des sites communautaires ===")
+            for game in community:
+                game_message(game)["embed"].to_dict()
+                duplicate = is_duplicate(game, known)
+                if game.name:
+                    known.add(game.name)
+                note = "  -> DOUBLON, ignoré" if duplicate else ""
+                print(f"[{game.via}] [{game.platform}] {game.title}{note}\n    nom repéré: {game.name} | {game.url}")
 
         for feed_url, items in (await sources.collect_news(session, NEWS_FEEDS)).items():
             print(f"\n=== Actus : {feed_url} ({len(items)} articles) ===")
