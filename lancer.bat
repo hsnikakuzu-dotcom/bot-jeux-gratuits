@@ -11,6 +11,11 @@ rem Windows ajoute parfois ".txt" en cachette quand on renomme le fichier
 if not exist .env if exist .env.txt ren .env.txt .env
 
 if not exist .env (
+    if not exist .env.example (
+        echo Le fichier .env.example est introuvable : reextrais le zip en entier.
+        pause
+        exit /b 1
+    )
     copy .env.example .env >nul
     echo Le fichier .env vient d'etre cree et s'ouvre dans le Bloc-notes.
     echo.

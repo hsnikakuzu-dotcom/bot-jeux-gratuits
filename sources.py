@@ -1,8 +1,10 @@
-"""Sources : jeux gratuits (Epic Games, GamerPower, Dealabs, GG.deals, Reddit) et actualités jeux vidéo (flux RSS)."""
+"""Sources : jeux gratuits (Epic, Steam, GOG, GamerPower, Dealabs, GG.deals, Reddit) et actus (flux RSS)."""
 from __future__ import annotations
 
+import asyncio
 import calendar
 import html
+import json
 import logging
 import re
 import unicodedata
@@ -13,6 +15,8 @@ from email.utils import parsedate_to_datetime
 
 import aiohttp
 import feedparser
+
+import steam
 
 log = logging.getLogger("sources")
 
@@ -25,6 +29,9 @@ EPIC_API = (
 )
 EPIC_STORE = "https://store.epicgames.com/fr"
 GAMERPOWER_API = "https://www.gamerpower.com/api/filter"
+STEAM_SEARCH = "https://store.steampowered.com/search/results/"
+GOG_CATALOG = "https://catalog.gog.com/v1/catalog"
+UBISOFT_FREE = "https://store.ubisoft.com/fr/free-games"
 
 
 @dataclass
@@ -41,6 +48,13 @@ class FreeGame:
     upcoming: bool = False
     name: str | None = None  # nom simplifié du jeu, pour repérer le même jeu sur plusieurs sites
     via: str | None = None   # site communautaire d'où vient l'offre (Dealabs, GG.deals, Reddit)
+    trusted: bool = False      # offre annoncée par la boutique elle-même : jamais filtrée sur la notoriété
+    needs_price: bool = False  # source incapable de distinguer un cadeau d'un jeu gratuit en permanence
+    steam: steam.SteamInfo | None = None  # rempli après coup par steam.enrich()
+
+    @property
+    def reviews(self) -> int:
+        return self.steam.reviews if self.steam else 0
 
 
 @dataclass
@@ -161,11 +175,153 @@ async def fetch_epic(session: aiohttp.ClientSession, include_upcoming: bool) -> 
             end=end,
             upcoming=upcoming,
             name=game_name(element.get("title")),
+            trusted=True,
+        ))
+    return games
+
+
+# ------------------------------------------------- Steam (promotions à -100 %)
+
+_STEAM_ROW = re.compile(r'<a href="(https://store\.steampowered\.com/app/\d+[^"?]*)[^>]*?data-ds-appid="(\d+)"(.*?)</a>', re.S)
+_STEAM_TITLE = re.compile(r'<span class="title">([^<]+)</span>')
+_STEAM_DISCOUNT = re.compile(r'data-discount="(\d+)"')
+_STEAM_PRICE = re.compile(r'<div class="discount_original_price">([^<]+)</div>')
+
+
+async def fetch_steam_free(session: aiohttp.ClientSession) -> list[FreeGame]:
+    """Jeux offerts directement par Steam (remise de 100 %), que GamerPower rate souvent.
+
+    `specials=1` écarte les free-to-play (gratuits en permanence) et `category1=998`
+    les DLC, bandes-son et packs d'objets, qui ne sont pas des jeux à part entière."""
+    params = {
+        "query": "", "start": 0, "count": 50, "force_infinite": 1, "infinite": 1,
+        "maxprice": "free", "specials": 1, "category1": 998, "json": 1, "cc": "FR", "l": "french",
+    }
+    async with session.get(STEAM_SEARCH, params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json(content_type=None)
+
+    games = []
+    for url, appid, body in _STEAM_ROW.findall(data.get("results_html") or ""):
+        discount = _STEAM_DISCOUNT.search(body)
+        title = _STEAM_TITLE.search(body)
+        if not discount or discount.group(1) != "100" or not title:
+            continue
+        price = _STEAM_PRICE.search(body)
+        name = html.unescape(title.group(1)).strip()
+        games.append(FreeGame(
+            key=f"steam:{appid}",
+            title=name,
+            platform="Steam",
+            url=url,
+            image=steam.HEADER_IMAGE.format(appid=appid),
+            worth=html.unescape(price.group(1)).strip() if price else None,
+            name=game_name(name),
+            trusted=True,
+        ))
+    return games
+
+
+# ------------------------------------------------- Ubisoft Store (jeux offerts)
+
+_UBI_PRODUCT = re.compile(r"var product = (\{.*?\});", re.S)
+# « FOR HONOR - STANDARD EDITION YEAR 8 » ou « PC DIG-GROWTOPIA-STANDARD-WW » -> le nom du jeu
+_UBI_CLEAN = re.compile(
+    r"^PC DIG-|\s*[-–]\s*(?:STANDARD|DELUXE|ULTIMATE|GOLD|FREE|PC DIG)\b.*$|-(?:WW|EMEA|EU|STANDARD)\b",
+    re.I,
+)
+# L'« édition » d'un jeu gratuit en permanence le dit : « Free to Play », « Accès Gratuit »…
+# Un vrai cadeau, lui, offre l'édition normale du jeu (« Édition Standard »).
+_UBI_FOREVER_FREE = re.compile(
+    r"free[\s-]?to[\s-]?play|free (?:access|starter|trial)|acc[èe]s (?:gratuit|starter)|essai|d[ée]mo|trial",
+    re.I,
+)
+
+
+async def fetch_ubisoft_free(session: aiohttp.ClientSession) -> list[FreeGame]:
+    """Page « Jeux gratuits » du Ubisoft Store.
+
+    Elle mélange les vrais cadeaux (For Honor) et les jeux gratuits en permanence (Brawlhalla,
+    Trackmania, Rainbow Six Siege…). Deux garde-fous les séparent : le champ `edition` du site,
+    puis `needs_price`, qui exige un vrai prix sur Steam avant de publier."""
+    async with session.get(UBISOFT_FREE) as resp:
+        resp.raise_for_status()
+        page = await resp.text()
+
+    games = []
+    for blob in _UBI_PRODUCT.findall(page):
+        try:
+            product = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        if _UBI_FOREVER_FREE.search(product.get("edition") or ""):
+            continue
+        title = _UBI_CLEAN.sub("", product.get("name") or "").strip(" -") or product.get("brand")
+        if not title or not product.get("id"):
+            continue
+        games.append(FreeGame(
+            key=f"ubisoft:{product['id']}",
+            title=title,
+            platform="Ubisoft Connect",
+            url=product.get("url") or UBISOFT_FREE,
+            image=product.get("image_url") or None,
+            name=game_name(title),
+            trusted=True,
+            needs_price=True,
+        ))
+    return games
+
+
+# ------------------------------------------------------ GOG (jeux à -100 %)
+
+async def fetch_gog_free(session: aiohttp.ClientSession) -> list[FreeGame]:
+    """Jeux offerts par GOG. Rare, mais ce sont souvent de vrais classiques."""
+    params = {
+        "limit": 48, "price": "between:0,0", "discounted": "eq:true",
+        "productType": "in:game,pack", "page": 1,
+        "countryCode": "FR", "locale": "fr-FR", "currencyCode": "EUR",
+    }
+    async with session.get(GOG_CATALOG, params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json(content_type=None)
+
+    games = []
+    for product in data.get("products") or []:
+        title = product.get("title") or ""
+        price = product.get("price") or {}
+        final = (price.get("finalMoney") or {}).get("amount")
+        if not title or final is None or float(final) > 0:
+            continue
+        games.append(FreeGame(
+            key=f"gog:{product.get('id')}",
+            title=title,
+            platform="GOG",
+            url=product.get("storeLink") or f"https://www.gog.com/fr/game/{product.get('slug', '')}",
+            image=product.get("coverHorizontal") or None,
+            worth=price.get("base"),
+            name=game_name(title),
+            trusted=True,
         ))
     return games
 
 
 # ------------------------------------------ GamerPower (Steam, GOG, itch.io...)
+
+# Plateformes comprises par GamerPower : les autres (prime-gaming…) feraient échouer la requête
+GAMERPOWER_PLATFORMS = {
+    "pc", "steam", "epic-games-store", "ubisoft", "gog", "itchio", "ps4", "ps5",
+    "xbox-one", "xbox-series-xs", "switch", "android", "ios", "vr", "battlenet", "origin", "drm-free",
+}
+
+# Boutiques où un jeu offert l'est forcément par l'éditeur lui-même : ces offres ne sont
+# jamais écartées par MIN_REVIEWS. Steam et Itch.io en sont volontairement absents :
+# n'importe qui peut y distribuer des clés, c'est là que se cache le tout-venant.
+FIRST_PARTY_STORES = re.compile(
+    r"epic games|\bgog\b|ubisoft|origin|\bea app\b|electronic arts|battle\.?net|blizzard|"
+    r"playstation|\bps[45]\b|xbox|nintendo|switch",
+    re.I,
+)
+
 
 async def fetch_gamerpower(session: aiohttp.ClientSession, platforms: list[str]) -> list[FreeGame]:
     params = {"platform": ".".join(platforms), "type": "game"}
@@ -188,38 +344,65 @@ async def fetch_gamerpower(session: aiohttp.ClientSession, platforms: list[str])
             continue
 
         stores = [p.strip() for p in (item.get("platforms") or "").split(",") if p.strip() not in ("", "PC")]
+        platform = ", ".join(stores) or "PC"
         worth = item.get("worth")
         title = re.sub(r"\s+Giveaway$", "", item.get("title") or "", flags=re.I)
         games.append(FreeGame(
             key=f"gamerpower:{item['id']}",
             title=title,
-            platform=", ".join(stores) or "PC",
+            platform=platform,
             url=item.get("open_giveaway_url") or item.get("gamerpower_url"),
             description=shorten(item.get("description"), 350),
             image=item.get("image") or item.get("thumbnail"),
             worth=worth if worth and worth != "N/A" else None,
             end=end,
             name=game_name(title),
+            # « FOR HONOR (Ubisoft) » vient d'Ubisoft : on ne l'écarte jamais, même sans avis Steam
+            trusted=bool(FIRST_PARTY_STORES.search(f"{platform} {title}")),
         ))
     return games
+
+
+async def _safe(label: str, coro) -> list[FreeGame]:
+    """Exécute une source ; en cas de panne on continue avec les autres."""
+    try:
+        return await coro
+    except Exception as error:
+        log.warning("%s indisponible (%s)", label, describe_error(error))
+        return []
 
 
 async def collect_free_games(
     session: aiohttp.ClientSession, platforms: list[str], include_upcoming: bool
 ) -> list[FreeGame]:
-    """Toutes les offres actuelles ; une source en panne n'empêche pas les autres."""
-    games: list[FreeGame] = []
-    others = [p for p in platforms if p != "epic-games-store"]
+    """Toutes les offres actuelles. Les sources sont interrogées en parallèle."""
+    # L'ordre compte : en cas de doublon, c'est la première source qui l'emporte.
+    # Ubisoft passe après GamerPower, qui connaît en plus la date de fin de l'offre.
+    jobs = []
+    others = [p for p in platforms if p != "epic-games-store" and p in GAMERPOWER_PLATFORMS]
     if "epic-games-store" in platforms:
-        try:
-            games += await fetch_epic(session, include_upcoming)
-        except Exception as error:
-            log.warning("Epic Games indisponible (%s)", describe_error(error))
+        jobs.append(_safe("Epic Games", fetch_epic(session, include_upcoming)))
+    if "steam" in platforms:
+        jobs.append(_safe("Steam", fetch_steam_free(session)))
+    if "gog" in platforms:
+        jobs.append(_safe("GOG", fetch_gog_free(session)))
     if others:
-        try:
-            games += await fetch_gamerpower(session, others)
-        except Exception as error:
-            log.warning("GamerPower indisponible (%s)", describe_error(error))
+        jobs.append(_safe("GamerPower", fetch_gamerpower(session, others)))
+    if "ubisoft" in platforms:
+        jobs.append(_safe("Ubisoft Store", fetch_ubisoft_free(session)))
+
+    games: list[FreeGame] = []
+    seen_keys: set[str] = set()
+    seen_names: set[str] = set()
+    for batch in await asyncio.gather(*jobs):
+        for game in batch:
+            # Steam et GamerPower annoncent souvent la même promo : on garde la 1re (Epic/Steam/GOG passent avant)
+            if game.key in seen_keys or (game.name and game.name in seen_names):
+                continue
+            seen_keys.add(game.key)
+            if game.name:
+                seen_names.add(game.name)
+            games.append(game)
     games.sort(key=lambda game: game.upcoming)  # offres disponibles d'abord, "bientôt gratuit" ensuite
     return games
 
@@ -230,10 +413,24 @@ _IMG_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.I)
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
 
-async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
-    async with session.get(url) as resp:
-        resp.raise_for_status()
-        return await resp.read()
+# Reddit refuse les User-Agent génériques (erreur 429) : il lui en faut un qui identifie le programme
+REDDIT_HEADERS = {"User-Agent": "python:bot-jeux-gratuits:2.0 (flux RSS public, lecture seule)"}
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+async def _download(session: aiohttp.ClientSession, url: str, attempts: int = 2) -> bytes:
+    """Télécharge une page ; un refus temporaire (429, 503…) est retenté une fois."""
+    headers = REDDIT_HEADERS if "reddit.com" in url else None
+    for attempt in range(attempts):
+        try:
+            async with session.get(url, headers=headers) as resp:
+                resp.raise_for_status()
+                return await resp.read()
+        except aiohttp.ClientResponseError as error:
+            if error.status not in RETRY_STATUSES or attempt == attempts - 1:
+                raise
+            await asyncio.sleep(3)
+    raise RuntimeError("unreachable")
 
 
 def _entry_image(entry) -> str | None:
@@ -261,9 +458,11 @@ COMMUNITY_SOURCES = {
 }
 COMMUNITY_MAX_AGE = timedelta(days=4)  # au-delà, l'offre est probablement terminée
 
-# (motif, nom affiché, identifiants de PLATFORMS qui l'autorisent ; vide = jamais, car payant)
+# (motif, nom affiché, identifiants de PLATFORMS qui l'autorisent ; vide = jamais)
 _PLATFORM_HINTS = [(re.compile(pattern, re.I), label, set(slugs)) for pattern, label, slugs in [
-    (r"\bprime gaming\b|\bamazon\b|\bluna\b", "Prime Gaming", []),
+    # Prime Gaming demande un abonnement Amazon Prime, mais ce sont souvent de gros jeux :
+    # à activer en ajoutant "prime-gaming" à PLATFORMS.
+    (r"\bprime gaming\b|\bamazon (?:prime|gaming)\b|\bluna\b", "Prime Gaming", ["prime-gaming"]),
     (r"\bepic\b", "Epic Games", ["epic-games-store"]),
     (r"\bsteam\b", "Steam", ["steam"]),
     (r"\bgog\b", "GOG", ["gog"]),
@@ -271,7 +470,7 @@ _PLATFORM_HINTS = [(re.compile(pattern, re.I), label, set(slugs)) for pattern, l
     (r"\bubisoft\b|\buplay\b", "Ubisoft Connect", ["ubisoft"]),
     (r"\bea app\b|\borigin\b|\belectronic arts\b", "EA", ["origin"]),
     (r"\bbattle\.?net\b", "Battle.net", ["battlenet"]),
-    (r"\bindiegala\b|\bdrm[- ]?free\b", "DRM-Free", ["drm-free"]),
+    (r"\bindiegala\b|\bfanatical\b|\bdrm[- ]?free\b|\bsans drm\b", "DRM-Free", ["drm-free"]),
     (r"\bplaystation\b|\bps[45]\b", "PlayStation", ["ps4", "ps5"]),
     (r"\bxbox\b", "Xbox", ["xbox-one", "xbox-series-xs"]),
     (r"\bswitch\b|\bnintendo\b", "Nintendo Switch", ["switch"]),
@@ -280,12 +479,12 @@ _PLATFORM_HINTS = [(re.compile(pattern, re.I), label, set(slugs)) for pattern, l
 ]]
 
 
-def _detect_platform(text: str, platforms: list[str]) -> tuple[str, bool]:
-    """Renvoie (plateforme affichée, autorisée par PLATFORMS ?)."""
+def _detect_platform(text: str, platforms: list[str]) -> tuple[str | None, bool]:
+    """Renvoie (plateforme reconnue ou None, autorisée par PLATFORMS ?)."""
     for pattern, label, slugs in _PLATFORM_HINTS:
         if pattern.search(text):
             return label, bool(slugs & set(platforms))
-    return "PC", True
+    return None, True  # aucune boutique reconnue : à chaque source de décider quoi en faire
 
 
 def _parse_rfc822(value: str | None) -> datetime | None:
@@ -296,7 +495,26 @@ def _parse_rfc822(value: str | None) -> datetime | None:
 
 
 _DEALABS_FREE = re.compile(r"\b(gratuite?s?|offerte?s?)\b", re.I)
-_DEALABS_SKIP = re.compile(r"jouable|week-?end|essai|d[ée]mo|game ?pass|abonnement|b[êe]ta|playtest|\bdlc\b|extension|skin|\bpack\b", re.I)
+_DEALABS_SKIP = re.compile(
+    r"jouable|week-?end|essai|d[ée]mo|game ?pass|abonnement|b[êe]ta|playtest|\bdlc\b|extension|skin|\bpack\b",
+    re.I,
+)
+# Ce qui n'est pas un jeu à garder : produits bancaires, matériel, contenu en jeu…
+# (c'est ce qui faisait passer « carte Amex gratuite » ou « voitures offertes pour Gran Turismo 7 »)
+_DEALABS_NOT_A_GAME = re.compile(
+    r"carte (?:bancaire|de cr[ée]dit|cadeau)|\bamex\b|american express|\bvisa\b|mastercard|banque|assurance|"
+    r"\bmiles\b|cashback|bon d'achat|forfait|box internet|mobile\b|"
+    r"manette|console|clavier|souris|casque|[ée]cran|si[èe]ge|figurine|goodies|t-?shirt|"
+    r"[ée]tude ponctuelle|timed research|\bresearch\b|monnaie|v-?bucks|robux|\bcoins?\b|gemmes|cr[ée]dits|"
+    r"r[ée]compense|\bavatar\b|tenue|costume|v[ée]hicule|voitures?\b|offertes? pour\b",
+    re.I,
+)
+# Une boutique de jeux connue dans le nom du marchand suffit à valider l'offre
+_DEALABS_GAME_SHOP = re.compile(
+    r"steam|epic|\bgog\b|itch|ubisoft|origin|\bea\b|electronic arts|battle|blizzard|"
+    r"playstation|xbox|microsoft|nintendo|indiegala|fanatical|humble|prime gaming|google play|app store",
+    re.I,
+)
 _DEALABS_IMAGE = re.compile(r'<img[^>]+src="(https://static-pepper\.dealabs\.com/threads/raw/[^"]+/fs/[^"]+)"')
 
 
@@ -312,14 +530,22 @@ def _parse_dealabs(raw: bytes, platforms: list[str]) -> list[FreeGame]:
                 fields[tag] = (child.text or "").strip()
 
         title = html.unescape(fields.get("title", ""))
+        merchant = fields.get("merchant", "")
         price = fields.get("price", "").strip()
         if not _DEALABS_FREE.search(title) or _DEALABS_SKIP.search(title):
             continue
+        if _DEALABS_NOT_A_GAME.search(title):
+            continue
         if price and not re.fullmatch(r"0+([,.]0+)?\s*€?", price):
             continue  # vraie promo payante
-        platform, allowed = _detect_platform(f"{fields.get('merchant', '')} {title}", platforms)
+        platform, allowed = _detect_platform(f"{merchant} {title}", platforms)
         if not allowed or not fields.get("link"):
             continue
+        # Le groupe « jeux-video » de Dealabs contient aussi du matériel et des bons plans divers :
+        # sans boutique de jeux reconnue ni le mot « jeu », on passe notre chemin.
+        if platform is None and not (_DEALABS_GAME_SHOP.search(merchant) or re.search(r"\bjeux?\b", title, re.I)):
+            continue
+        platform = platform or "PC"
 
         # « [PC] Mechabellum Gratuit sur PC (Dématérialisé) » -> « Mechabellum »
         name = re.sub(r"^\s*(\[[^\]]*\]\s*)+|^\s*(le\s+)?jeu\s+", "", title, flags=re.I)
@@ -354,7 +580,7 @@ def _parse_ggdeals(raw: bytes, platforms: list[str]) -> list[FreeGame]:
     for entry in feedparser.parse(raw).entries:
         title = html.unescape(entry.get("title", ""))
         platform, allowed = _detect_platform(title, platforms)
-        freebie_on_store = re.search(r"\bfreebies?\b", title, re.I) and platform != "PC"
+        freebie_on_store = re.search(r"\bfreebies?\b", title, re.I) and platform is not None
         if not (_GG_KEEP.search(title) or freebie_on_store) or _GG_SKIP.search(title) or not allowed:
             continue
         name = next((match.group(1) for pattern in _GG_NAME if (match := pattern.search(title))), None)
@@ -363,7 +589,7 @@ def _parse_ggdeals(raw: bytes, platforms: list[str]) -> list[FreeGame]:
         games.append(FreeGame(
             key=f"ggdeals:{entry.get('id') or entry.get('link')}",
             title=shorten(title, 256),
-            platform=platform,
+            platform=platform or "PC",
             url=entry.get("link"),
             description=shorten(clean_html(entry.get("summary")), 300),
             image=_entry_image(entry),
@@ -394,7 +620,7 @@ def _parse_reddit(raw: bytes, platforms: list[str]) -> list[FreeGame]:
         games.append(FreeGame(
             key=f"reddit:{entry.get('id') or entry.get('link')}",
             title=shorten(name, 256),
-            platform=store if platform == "PC" else platform,
+            platform=platform or store,
             url=html.unescape(link.group(1)) if link else entry.get("link"),
             image=_entry_image(entry),
             start=_entry_date(entry),
@@ -409,23 +635,26 @@ _COMMUNITY_PARSERS = {"dealabs": _parse_dealabs, "ggdeals": _parse_ggdeals, "red
 
 async def collect_community(session: aiohttp.ClientSession, enabled: list[str], platforms: list[str]) -> list[FreeGame]:
     """Jeux gratuits repérés par les communautés. Un site en panne ou bloqué n'empêche pas les autres."""
+    async def one(source: str, label: str, url: str) -> list[FreeGame]:
+        try:
+            return _COMMUNITY_PARSERS[source](await _download(session, url), platforms)
+        except Exception as error:
+            log.warning("%s indisponible (%s)", label, describe_error(error))
+            return []
+
+    jobs = [
+        one(source, COMMUNITY_SOURCES[source][0], url)
+        for source in enabled if source in COMMUNITY_SOURCES
+        for url in COMMUNITY_SOURCES[source][1]
+    ]
     oldest = datetime.now(timezone.utc) - COMMUNITY_MAX_AGE
     games, seen = [], set()
-    for source in enabled:
-        if source not in COMMUNITY_SOURCES:
-            continue
-        label, urls = COMMUNITY_SOURCES[source]
-        for url in urls:
-            try:
-                items = _COMMUNITY_PARSERS[source](await _download(session, url), platforms)
-            except Exception as error:
-                log.warning("%s indisponible (%s)", label, describe_error(error))
+    for batch in await asyncio.gather(*jobs):
+        for game in batch:
+            if game.key in seen or (game.start and game.start < oldest):
                 continue
-            for game in items:
-                if game.key in seen or (game.start and game.start < oldest):
-                    continue
-                seen.add(game.key)
-                games.append(game)
+            seen.add(game.key)
+            games.append(game)
     return games
 
 
@@ -454,10 +683,12 @@ async def fetch_news(session: aiohttp.ClientSession, feed_url: str) -> list[News
 
 async def collect_news(session: aiohttp.ClientSession, feed_urls: list[str]) -> dict[str, list[NewsItem]]:
     """{url du flux: articles}. Les flux en erreur sont simplement absents du résultat."""
-    result = {}
-    for url in feed_urls:
+    async def one(url: str) -> tuple[str, list[NewsItem] | None]:
         try:
-            result[url] = await fetch_news(session, url)
+            return url, await fetch_news(session, url)
         except Exception as error:
             log.warning("Flux d'actus indisponible (%s) : %s", url, describe_error(error))
-    return result
+            return url, None
+
+    pairs = await asyncio.gather(*(one(url) for url in feed_urls))
+    return {url: items for url, items in pairs if items is not None}
